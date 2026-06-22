@@ -1,0 +1,21 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mard"
+version = "0.1.0"
+description = "Personal media archive and deduplication CLI tool"
+requires-python = ">=3.10"
+dependencies = [
+    "typer>=0.12",
+    "sqlalchemy>=2.0",
+    "rich>=13.0",
+    "blake3>=0.4",
+]
+
+[project.scripts]
+mard = "mard.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["mard"]
