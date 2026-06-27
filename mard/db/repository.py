@@ -27,6 +27,12 @@ class DeviceRepo:
         self._s.flush()
         return device
 
+    def get_by_id(self, device_id: str) -> Optional[StorageDevice]:
+        return self._s.get(StorageDevice, device_id)
+
+    def get_all(self) -> list[StorageDevice]:
+        return list(self._s.scalars(select(StorageDevice)))
+
     def touch(self, device_id: str, mount_hint: str) -> None:
         self._s.execute(
             update(StorageDevice)
@@ -146,6 +152,64 @@ class FileInstanceRepo:
             )
         )
 
+    def get_without_content_hash(self, device_id: str) -> list[FileInstance]:
+        """Instances on device that have quick_hash but no content_hash."""
+        return list(
+            self._s.scalars(
+                select(FileInstance).where(
+                    FileInstance.device_id == device_id,
+                    FileInstance.exists == True,  # noqa: E712
+                    FileInstance.content_hash.is_(None),
+                    FileInstance.quick_hash.is_not(None),
+                )
+            )
+        )
+
+    def get_without_asset(self, device_id: str) -> list[FileInstance]:
+        """Instances on device with content_hash but no MediaAsset linked."""
+        return list(
+            self._s.scalars(
+                select(FileInstance).where(
+                    FileInstance.device_id == device_id,
+                    FileInstance.exists == True,  # noqa: E712
+                    FileInstance.content_hash.is_not(None),
+                    FileInstance.media_asset_id.is_(None),
+                )
+            )
+        )
+
+    def get_without_meta(self, device_id: str) -> list[FileInstance]:
+        """Instances on device whose MediaAsset has no taken_at yet."""
+        return list(
+            self._s.scalars(
+                select(FileInstance)
+                .join(MediaAsset, MediaAsset.id == FileInstance.media_asset_id)
+                .where(
+                    FileInstance.device_id == device_id,
+                    FileInstance.exists == True,  # noqa: E712
+                    FileInstance.media_asset_id.is_not(None),
+                    MediaAsset.taken_at.is_(None),
+                )
+            )
+        )
+
+    def get_by_asset_id(self, asset_id: str) -> list[FileInstance]:
+        return list(
+            self._s.scalars(
+                select(FileInstance).where(
+                    FileInstance.media_asset_id == asset_id,
+                    FileInstance.exists == True,  # noqa: E712
+                )
+            )
+        )
+
+    def set_media_asset(self, instance_id: str, asset_id: str) -> None:
+        self._s.execute(
+            update(FileInstance)
+            .where(FileInstance.id == instance_id)
+            .values(media_asset_id=asset_id)
+        )
+
     def get_exact_duplicate_groups(self) -> list[list[FileInstance]]:
         """Return groups of FileInstances sharing the same content_hash (count > 1)."""
         hashes = self._s.execute(
@@ -181,6 +245,42 @@ class MediaAssetRepo:
         self._s.add(asset)
         self._s.flush()
         return asset
+
+    def get_by_id(self, asset_id: str) -> Optional[MediaAsset]:
+        return self._s.get(MediaAsset, asset_id)
+
+    def update_meta(
+        self,
+        asset_id: str,
+        taken_at,
+        taken_at_source: str,
+        camera_model,
+        width,
+        height,
+        gps_lat,
+        gps_lng,
+        duration,
+    ) -> None:
+        values: dict = {}
+        if taken_at is not None:
+            values["taken_at"] = taken_at
+            values["taken_at_source"] = taken_at_source
+        if camera_model is not None:
+            values["camera_model"] = camera_model
+        if width is not None:
+            values["width"] = width
+        if height is not None:
+            values["height"] = height
+        if gps_lat is not None:
+            values["gps_lat"] = gps_lat
+        if gps_lng is not None:
+            values["gps_lng"] = gps_lng
+        if duration is not None:
+            values["duration"] = duration
+        if values:
+            self._s.execute(
+                update(MediaAsset).where(MediaAsset.id == asset_id).values(**values)
+            )
 
 
 class DuplicateGroupRepo:

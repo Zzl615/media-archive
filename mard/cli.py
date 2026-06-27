@@ -10,14 +10,15 @@ from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeEl
 from rich.table import Table
 from rich import box
 
-from .db.database import build_session_factory
-from .db.repository import DeviceRepo, DuplicateGroupRepo, FileInstanceRepo
+from .db.database import build_session_factory, open_session
+from .db.repository import DeviceRepo, DuplicateGroupRepo, FileInstanceRepo, MediaAssetRepo
 from .hasher import HASH_ALGO
+from .meta import run_meta
 from .scanner import scan_device
 
 app = typer.Typer(
     name="mard",
-    help="Media Archive & Dedupe — Phase 1",
+    help="Media Archive & Dedupe",
     add_completion=False,
 )
 console = Console()
@@ -99,6 +100,7 @@ def duplicates(
     exact: bool = typer.Option(False, "--exact", help="Show exact (content-hash) duplicates"),
     db: Path = typer.Option(_DEFAULT_DB, help="Path to the index database"),
     limit: int = typer.Option(50, help="Max number of groups to display"),
+    output: Optional[Path] = typer.Option(None, "--output", "-o", help="Write report to file"),
 ):
     """Report duplicate file groups detected in the index."""
     if not exact:
@@ -107,74 +109,134 @@ def duplicates(
 
     factory = _get_factory(db)
 
-    from .db.database import open_session
     with open_session(factory) as s:
+        all_groups = DuplicateGroupRepo(s).get_all_exact()
+        if not all_groups:
+            console.print("[green]No exact duplicates found.[/green]  Run [bold]mard scan[/bold] first.")
+            raise typer.Exit(0)
+
         dup_repo = DuplicateGroupRepo(s)
         fi_repo = FileInstanceRepo(s)
         dev_repo = DeviceRepo(s)
 
-        groups = dup_repo.get_all_exact()
+        # Build device_id → display name map
+        device_names = {
+            d.id: (d.volume_label or d.mount_hint or d.id[:8])
+            for d in dev_repo.get_all()
+        }
 
-        if not groups:
-            console.print("[green]No exact duplicates found.[/green]  Run [bold]mard scan[/bold] first.")
-            raise typer.Exit(0)
+        # Collect full stats across all groups
+        total_groups = len(all_groups)
+        total_wasted = 0
+        total_dup_files = 0
+        group_data = []  # (group, members) for display
 
-        total_groups = len(groups)
-        groups = groups[:limit]
+        for group in all_groups:
+            members = dup_repo.get_members(group.id)
+            if not members:
+                continue
+            copies = len(members)
+            size = members[0].size or 0
+            wasted = size * (copies - 1)
+            total_wasted += wasted
+            total_dup_files += copies
+            group_data.append((group, members, wasted))
 
-        _print_exact_duplicates(groups, dup_repo, fi_repo, dev_repo)
+        # Sort by wasted space descending
+        group_data.sort(key=lambda x: x[2], reverse=True)
 
+        # ── header summary ────────────────────────────────────────────────────
+        n_devices = len(device_names)
+        header = (
+            f"[bold]Exact Duplicates Report[/bold]  "
+            f"[dim]{n_devices} device(s) · "
+            f"{total_groups} group(s) · "
+            f"{total_dup_files} duplicate files · "
+            f"[red]{_fmt_bytes(total_wasted)}[/red][dim] can be freed[/dim]"
+        )
+        console.print(header)
+
+        # ── per-group detail ──────────────────────────────────────────────────
+        shown = group_data[:limit]
+        for i, (group, members, wasted) in enumerate(shown, 1):
+            keep_id = group.recommended_keep_instance_id
+            chash = members[0].content_hash or "?"
+            size = members[0].size or 0
+
+            console.print(
+                f"\n[bold]Group {i}[/bold]  "
+                f"hash=[cyan]{chash[:16]}…[/cyan]  "
+                f"size=[yellow]{_fmt_bytes(size)}[/yellow]  "
+                f"copies=[red]{len(members)}[/red]  "
+                f"frees=[magenta]{_fmt_bytes(wasted)}[/magenta]"
+            )
+
+            t = Table(box=box.SIMPLE_HEAD, show_header=True, padding=(0, 1))
+            t.add_column("", width=4, no_wrap=True)
+            t.add_column("Device", style="cyan", no_wrap=True)
+            t.add_column("Path")
+            t.add_column("Modified", style="dim", no_wrap=True)
+
+            for fi in members:
+                marker = "[green]keep[/green]" if fi.id == keep_id else ""
+                dev_name = device_names.get(fi.device_id, fi.device_id[:8])
+                mtime_str = fi.mtime.strftime("%Y-%m-%d %H:%M") if fi.mtime else "?"
+                t.add_row(marker, dev_name, fi.path, mtime_str)
+
+            console.print(t)
+
+        # ── footer ────────────────────────────────────────────────────────────
         if total_groups > limit:
             console.print(
-                f"\n[dim]Showing {limit} of {total_groups} groups. "
+                f"\n[dim]Showing top {limit} of {total_groups} groups (sorted by wasted space). "
                 f"Use --limit to see more.[/dim]"
             )
-        else:
-            console.print(f"\n[bold]{total_groups}[/bold] exact duplicate group(s) total.")
-
-        # Wasted space estimate
-        with open_session(factory) as s2:
-            fi_repo2 = FileInstanceRepo(s2)
-            all_groups = fi_repo2.get_exact_duplicate_groups()
-            wasted = sum(
-                fi.size * (len(g) - 1)
-                for g in all_groups
-                for fi in g[:1]
-            )
-        console.print(f"Estimated wasted space: [red]{_fmt_bytes(wasted)}[/red]")
-
-
-def _print_exact_duplicates(groups, dup_repo, fi_repo, dev_repo) -> None:
-    from .db.database import open_session
-
-    for i, group in enumerate(groups, 1):
-        members = dup_repo.get_members(group.id)
-        if not members:
-            continue
-
-        keep_id = group.recommended_keep_instance_id
-        chash = members[0].content_hash or "?"
 
         console.print(
-            f"\n[bold]Group {i}[/bold]  "
-            f"hash=[cyan]{chash[:16]}…[/cyan]  "
-            f"size=[yellow]{_fmt_bytes(members[0].size)}[/yellow]  "
-            f"copies=[red]{len(members)}[/red]"
+            f"\n[bold]Total:[/bold] {total_groups} group(s) · "
+            f"{total_dup_files} duplicate files · "
+            f"[red]{_fmt_bytes(total_wasted)}[/red] can be freed"
         )
 
-        t = Table(box=box.SIMPLE_HEAD, show_header=True, padding=(0, 1))
-        t.add_column("", width=3)
-        t.add_column("Device", style="dim")
-        t.add_column("Path")
-        t.add_column("Modified", style="dim")
+        # ── optional file output ──────────────────────────────────────────────
+        if output:
+            _write_text_report(output, group_data[:limit], device_names, total_groups,
+                               total_dup_files, total_wasted, limit)
+            console.print(f"\nReport saved to [cyan]{output}[/cyan]")
 
+
+def _write_text_report(
+    path: Path,
+    group_data: list,
+    device_names: dict,
+    total_groups: int,
+    total_dup_files: int,
+    total_wasted: int,
+    limit: int,
+) -> None:
+    lines = [
+        f"Exact Duplicates Report",
+        f"Groups: {total_groups}  Duplicate files: {total_dup_files}  "
+        f"Can free: {_fmt_bytes(total_wasted)}",
+        "",
+    ]
+    for i, (group, members, wasted) in enumerate(group_data, 1):
+        keep_id = group.recommended_keep_instance_id
+        chash = members[0].content_hash or "?"
+        size = members[0].size or 0
+        lines.append(
+            f"Group {i}  hash={chash[:16]}  "
+            f"size={_fmt_bytes(size)}  copies={len(members)}  frees={_fmt_bytes(wasted)}"
+        )
         for fi in members:
-            marker = "[green]keep[/green]" if fi.id == keep_id else ""
-            device_label = fi.device_id[:8]
-            mtime_str = fi.mtime.strftime("%Y-%m-%d %H:%M") if fi.mtime else "?"
-            t.add_row(marker, device_label, fi.path, mtime_str)
-
-        console.print(t)
+            tag = "[keep]" if fi.id == keep_id else "      "
+            dev = device_names.get(fi.device_id, fi.device_id[:8])
+            mtime = fi.mtime.strftime("%Y-%m-%d %H:%M") if fi.mtime else "?"
+            lines.append(f"  {tag} {dev}  {fi.path}  ({mtime})")
+        lines.append("")
+    if total_groups > limit:
+        lines.append(f"... {total_groups - limit} more groups not shown (use --limit)")
+    path.write_text("\n".join(lines), encoding="utf-8")
 
 
 def _fmt_bytes(n: int) -> str:
@@ -183,6 +245,74 @@ def _fmt_bytes(n: int) -> str:
             return f"{n:.1f} {unit}"
         n /= 1024
     return f"{n:.1f} PB"
+
+
+# ── meta ──────────────────────────────────────────────────────────────────────
+
+@app.command()
+def meta(
+    device: Path = typer.Option(..., help="Mount path of the drive"),
+    db: Path = typer.Option(_DEFAULT_DB, help="Path to the index database"),
+):
+    """Extract EXIF metadata: fullhash remaining files, create MediaAssets, read EXIF."""
+    if not device.exists() or not device.is_dir():
+        console.print(f"[red]Error:[/red] {device} is not a valid directory.")
+        raise typer.Exit(1)
+
+    factory = _get_factory(db)
+
+    # Look up device_id from DB via marker file
+    from .device import identify_device, MARKER_FILE
+    marker = device / MARKER_FILE
+    if not marker.exists():
+        console.print("[red]Error:[/red] Device not registered. Run [bold]mard scan[/bold] first.")
+        raise typer.Exit(1)
+
+    import json as _json
+    device_marker_id = _json.loads(marker.read_text())["device_id"]
+    with open_session(factory) as s:
+        dev = DeviceRepo(s).get_by_marker_id(device_marker_id)
+    if dev is None:
+        console.print("[red]Error:[/red] Device not found in database.")
+        raise typer.Exit(1)
+    device_id = dev.id
+
+    console.print(f"[bold]mard meta[/bold]  device=[cyan]{device}[/cyan]  db=[cyan]{db}[/cyan]\n")
+
+    phase_task = {}
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TextColumn("[cyan]{task.completed}/{task.total}[/cyan]"),
+        TimeElapsedColumn(),
+        console=console,
+        transient=True,
+    ) as progress:
+        task_fullhash = progress.add_task("Phase A: full hash…", total=None)
+        task_exif = progress.add_task("Phase C: EXIF…", total=None)
+
+        def on_progress(phase: str, done: int, total: int) -> None:
+            if phase == "fullhash":
+                progress.update(task_fullhash, completed=done, total=max(total, 1))
+            elif phase == "exif":
+                progress.update(task_exif, completed=done, total=max(total, 1))
+
+        try:
+            result = run_meta(device, device_id, factory, progress_cb=on_progress)
+        except KeyboardInterrupt:
+            console.print("\n[yellow]Interrupted.[/yellow]")
+            raise typer.Exit(130)
+
+    console.print("[bold green]meta complete.[/bold green]\n")
+    t = Table(box=box.SIMPLE, show_header=False, padding=(0, 2))
+    t.add_column(style="dim")
+    t.add_column(justify="right", style="bold")
+    t.add_row("Files full-hashed", str(result.fullhash_done))
+    t.add_row("MediaAssets created", str(result.assets_created))
+    t.add_row("Assets EXIF-updated", str(result.exif_updated))
+    console.print(t)
 
 
 if __name__ == "__main__":
