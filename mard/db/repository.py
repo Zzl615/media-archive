@@ -210,6 +210,13 @@ class FileInstanceRepo:
             .values(media_asset_id=asset_id)
         )
 
+    def set_exists(self, instance_id: str, exists: bool) -> None:
+        self._s.execute(
+            update(FileInstance)
+            .where(FileInstance.id == instance_id)
+            .values(exists=exists)
+        )
+
     def get_exact_duplicate_groups(self) -> list[list[FileInstance]]:
         """Return groups of FileInstances sharing the same content_hash (count > 1)."""
         hashes = self._s.execute(

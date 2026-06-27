@@ -14,6 +14,7 @@ from .db.database import build_session_factory, open_session
 from .db.repository import DeviceRepo, DuplicateGroupRepo, FileInstanceRepo, MediaAssetRepo
 from .hasher import HASH_ALGO
 from .meta import run_meta
+from .quarantine import QUARANTINE_DIR, run_quarantine
 from .scanner import scan_device
 
 app = typer.Typer(
@@ -245,6 +246,94 @@ def _fmt_bytes(n: int) -> str:
             return f"{n:.1f} {unit}"
         n /= 1024
     return f"{n:.1f} PB"
+
+
+# ── quarantine ────────────────────────────────────────────────────────────────
+
+@app.command()
+def quarantine(
+    device: Path = typer.Option(..., help="Mount path of the drive"),
+    db: Path = typer.Option(_DEFAULT_DB, help="Path to the index database"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Preview without moving files"),
+):
+    """Move duplicate copies (non-keep) to .media-archive-quarantine/ on the device."""
+    if not device.exists() or not device.is_dir():
+        console.print(f"[red]Error:[/red] {device} is not a valid directory.")
+        raise typer.Exit(1)
+
+    factory = _get_factory(db)
+
+    from .device import MARKER_FILE
+    import json as _json
+    marker = device / MARKER_FILE
+    if not marker.exists():
+        console.print("[red]Error:[/red] Device not registered. Run [bold]mard scan[/bold] first.")
+        raise typer.Exit(1)
+
+    device_marker_id = _json.loads(marker.read_text())["device_id"]
+    with open_session(factory) as s:
+        dev = DeviceRepo(s).get_by_marker_id(device_marker_id)
+    if dev is None:
+        console.print("[red]Error:[/red] Device not found in database.")
+        raise typer.Exit(1)
+
+    device_id = dev.id
+    quarantine_path = device / QUARANTINE_DIR
+
+    if dry_run:
+        console.print("[yellow]DRY RUN — no files will be moved.[/yellow]\n")
+    console.print(
+        f"[bold]mard quarantine[/bold]  device=[cyan]{device}[/cyan]  "
+        f"quarantine=[cyan]{quarantine_path}[/cyan]\n"
+    )
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TextColumn("[cyan]{task.completed}/{task.total}[/cyan] groups"),
+        TimeElapsedColumn(),
+        console=console,
+        transient=True,
+    ) as progress:
+        task = progress.add_task("Processing duplicate groups…", total=None)
+
+        def on_progress(done: int, total: int, _: str) -> None:
+            progress.update(task, completed=done, total=max(total, 1))
+
+        try:
+            result = run_quarantine(device, device_id, factory, dry_run=dry_run, progress_cb=on_progress)
+        except KeyboardInterrupt:
+            console.print("\n[yellow]Interrupted.[/yellow]")
+            raise typer.Exit(130)
+
+    status = "[yellow]DRY RUN complete.[/yellow]" if dry_run else "[bold green]Quarantine complete.[/bold green]"
+    console.print(f"{status}\n")
+
+    t = Table(box=box.SIMPLE, show_header=False, padding=(0, 2))
+    t.add_column(style="dim")
+    t.add_column(justify="right", style="bold")
+    t.add_row("Duplicate groups scanned", str(result.total_groups))
+    t.add_row("Files moved to quarantine", str(result.moved))
+    t.add_row("Already gone (exists=False)", str(result.already_gone))
+    t.add_row("Skipped — keep file missing", f"[yellow]{result.skipped_no_keep}[/yellow]")
+    t.add_row("Skipped — would remove only copy", f"[yellow]{result.skipped_only_copy}[/yellow]")
+    t.add_row("Errors", f"[red]{result.error}[/red]")
+    console.print(t)
+
+    if result.moved_paths:
+        console.print(f"\n[dim]Quarantine location:[/dim] [cyan]{quarantine_path}[/cyan]")
+        if dry_run:
+            console.print("\n[dim]Files that would be moved:[/dim]")
+            for src, _ in result.moved_paths[:20]:
+                console.print(f"  [dim]{src}[/dim]")
+            if len(result.moved_paths) > 20:
+                console.print(f"  [dim]… and {len(result.moved_paths) - 20} more[/dim]")
+        else:
+            console.print(
+                f"\nReview files in [cyan]{quarantine_path}[/cyan] then delete manually when satisfied.\n"
+                f"Run [bold]mard scan --device {device}[/bold] to update the index."
+            )
 
 
 # ── meta ──────────────────────────────────────────────────────────────────────
