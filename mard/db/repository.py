@@ -7,7 +7,7 @@ from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
 from .models import (
-    DuplicateGroup, DuplicateGroupMember, DuplicateType,
+    ArchiveStatus, DuplicateGroup, DuplicateGroupMember, DuplicateType,
     FileInstance, MediaAsset, ReviewStatus, ScanSession,
     ScanStatus, StorageDevice,
 )
@@ -288,6 +288,20 @@ class MediaAssetRepo:
             self._s.execute(
                 update(MediaAsset).where(MediaAsset.id == asset_id).values(**values)
             )
+
+    def update_archive_status(self, asset_id: str, status: ArchiveStatus) -> None:
+        self._s.execute(
+            update(MediaAsset).where(MediaAsset.id == asset_id).values(archive_status=status)
+        )
+
+    def get_pending_archive(self) -> list[MediaAsset]:
+        return list(
+            self._s.scalars(
+                select(MediaAsset)
+                .where(MediaAsset.archive_status == ArchiveStatus.pending)
+                .order_by(MediaAsset.taken_at)
+            )
+        )
 
 
 class DuplicateGroupRepo:

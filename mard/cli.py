@@ -10,6 +10,7 @@ from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeEl
 from rich.table import Table
 from rich import box
 
+from .archive import ApplyResult, generate_plan, write_plan, apply_plan
 from .db.database import build_session_factory, open_session
 from .db.repository import DeviceRepo, DuplicateGroupRepo, FileInstanceRepo, MediaAssetRepo
 from .hasher import HASH_ALGO
@@ -402,6 +403,139 @@ def meta(
     t.add_row("MediaAssets created", str(result.assets_created))
     t.add_row("Assets EXIF-updated", str(result.exif_updated))
     console.print(t)
+
+
+# ── archive-plan ──────────────────────────────────────────────────────────────
+
+@app.command(name="archive-plan")
+def archive_plan(
+    archive: Path = typer.Option(..., help="Target archive root directory"),
+    db: Path = typer.Option(_DEFAULT_DB, help="Path to the index database"),
+    device: Optional[Path] = typer.Option(None, help="Prefer instances from this device mount"),
+    output: Path = typer.Option(Path("archive-plan.jsonl"), help="Output plan file"),
+):
+    """Generate a dry-run archive plan (JSONL) for all pending MediaAssets."""
+    factory = _get_factory(db)
+
+    device_id: Optional[str] = None
+    if device is not None:
+        from .device import MARKER_FILE
+        import json as _json
+        marker = device / MARKER_FILE
+        if marker.exists():
+            device_marker_id = _json.loads(marker.read_text())["device_id"]
+            with open_session(factory) as s:
+                dev = DeviceRepo(s).get_by_marker_id(device_marker_id)
+            if dev:
+                device_id = dev.id
+
+    console.print(f"[bold]mard archive-plan[/bold]  archive=[cyan]{archive}[/cyan]\n")
+
+    with console.status("Generating plan…"):
+        plan = generate_plan(archive, factory, device_id=device_id)
+
+    write_plan(plan, output)
+
+    total_size = sum(e.size or 0 for e in plan)
+    dated = sum(1 for e in plan if e.taken_at)
+    undated = len(plan) - dated
+
+    console.print(f"[bold green]Plan written:[/bold green] [cyan]{output}[/cyan]\n")
+    t = Table(box=box.SIMPLE, show_header=False, padding=(0, 2))
+    t.add_column(style="dim")
+    t.add_column(justify="right", style="bold")
+    t.add_row("Files to archive", str(len(plan)))
+    t.add_row("  with EXIF date", str(dated))
+    t.add_row("  no date (→ unknown/)", str(undated))
+    t.add_row("Total size", _fmt_bytes(total_size))
+    console.print(t)
+
+    if plan:
+        console.print(
+            f"\nReview [cyan]{output}[/cyan], then run "
+            f"[bold]mard archive-apply --plan {output} --device <mount>[/bold]"
+        )
+
+
+# ── archive-apply ─────────────────────────────────────────────────────────────
+
+@app.command(name="archive-apply")
+def archive_apply(
+    plan: Path = typer.Option(..., help="Plan file produced by archive-plan"),
+    device: Path = typer.Option(..., help="Mount path of the source device"),
+    db: Path = typer.Option(_DEFAULT_DB, help="Path to the index database"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Simulate without copying"),
+):
+    """Copy files to archive according to the plan, verify hash, update status."""
+    if not plan.exists():
+        console.print(f"[red]Error:[/red] Plan file not found: {plan}")
+        raise typer.Exit(1)
+    if not device.exists() or not device.is_dir():
+        console.print(f"[red]Error:[/red] Device path not found: {device}")
+        raise typer.Exit(1)
+
+    factory = _get_factory(db)
+
+    # Map device_id → mount path
+    from .device import MARKER_FILE
+    import json as _json
+    marker = device / MARKER_FILE
+    if not marker.exists():
+        console.print("[red]Error:[/red] Device marker not found. Run [bold]mard scan[/bold] first.")
+        raise typer.Exit(1)
+
+    device_marker_id = _json.loads(marker.read_text())["device_id"]
+    with open_session(factory) as s:
+        dev = DeviceRepo(s).get_by_marker_id(device_marker_id)
+    if dev is None:
+        console.print("[red]Error:[/red] Device not found in database.")
+        raise typer.Exit(1)
+
+    mount_paths = {dev.id: device}
+
+    if dry_run:
+        console.print("[yellow]DRY RUN — no files will be written.[/yellow]\n")
+    console.print(f"[bold]mard archive-apply[/bold]  plan=[cyan]{plan}[/cyan]\n")
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TextColumn("[cyan]{task.completed}/{task.total}[/cyan]"),
+        TimeElapsedColumn(),
+        console=console,
+        transient=True,
+    ) as progress:
+        task = progress.add_task("Copying…", total=None)
+
+        def on_progress(done: int, total: int, path: str) -> None:
+            progress.update(task, completed=done, total=max(total, 1),
+                            description=f"[dim]{Path(path).name[-50:]}[/dim]")
+
+        try:
+            result = apply_plan(plan, mount_paths, factory, dry_run=dry_run, progress_cb=on_progress)
+        except KeyboardInterrupt:
+            console.print("\n[yellow]Interrupted.[/yellow] Re-run to resume (idempotent).")
+            raise typer.Exit(130)
+
+    status = "[yellow]DRY RUN complete.[/yellow]" if dry_run else "[bold green]Apply complete.[/bold green]"
+    console.print(f"{status}\n")
+    t = Table(box=box.SIMPLE, show_header=False, padding=(0, 2))
+    t.add_column(style="dim")
+    t.add_column(justify="right", style="bold")
+    t.add_row("Total entries", str(result.total))
+    t.add_row("Copied (+ hash verified)", str(result.copied))
+    t.add_row("Already archived", str(result.already_done))
+    t.add_row("Skipped (skip=true in plan)", str(result.skipped))
+    t.add_row("Hash conflicts", f"[red]{result.conflict}[/red]")
+    t.add_row("Missing source", f"[red]{result.missing_source}[/red]")
+    t.add_row("Errors", f"[red]{result.error}[/red]")
+    console.print(t)
+
+    if result.conflicts:
+        console.print("\n[red]Hash conflicts (manual review needed):[/red]")
+        for p in result.conflicts[:10]:
+            console.print(f"  {p}")
 
 
 if __name__ == "__main__":
