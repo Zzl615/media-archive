@@ -38,6 +38,9 @@ pip install -e .
 # 扫描一块硬盘（首次会在硬盘根目录创建 .media-archive-device.json）
 mard scan --device /Volumes/JZAO
 
+# 并行 Hash 加速（SSD 推荐 4 workers，HDD 保持 1）
+mard scan --device /Volumes/JZAO --workers 4
+
 # 查看精确重复文件
 mard duplicates --exact
 mard duplicates --exact --output dup-report.txt   # 导出纯文本报告
@@ -74,6 +77,32 @@ Archive/
   unknown/
     0000-00-00_00-00-00_nodate_12345678.jpg
 ```
+
+## 性能与故障处理
+
+### 扫描加速
+
+- **批量事务**：Phase 1 每 200 个文件提交一次数据库事务，大幅减少磁盘 fsync 次数。
+- **并行 Hash**：`--workers` 开启多线程并行计算 quick hash（文件 I/O 与 DB 写入重叠）。
+  - SSD / 内置盘：`--workers 4`。
+  - 机械移动硬盘：保持默认 `--workers 1`（顺序读更快）。
+- **Read buffer**：文件读取缓冲区 1 MB，减少系统调用。
+
+### exFAT / NTFS 卷
+
+非原生文件系统（exFAT、NTFS）在 macOS 上并发读写可能出现偶发 `OSError [Errno 5] Input/output error`。
+
+**建议**：扫描前在卷根目录创建 `.metadata_never_index` 禁止 Spotlight 抢盘：
+
+```bash
+touch /Volumes/你的盘名/.metadata_never_index
+```
+
+`mard scan` 遇到 I/O 错误会**跳过该文件继续扫描**，并在结果中显示 `I/O errors` 计数，不再中断。
+
+### 可恢复中断
+
+`Ctrl+C` 可随时中断扫描，已处理文件的索引已持久化。下次 `mard scan` 同盘时自动恢复，已索引且未变化（size + mtime 相同）的文件直接跳过。
 
 ## 项目结构
 

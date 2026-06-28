@@ -15,7 +15,7 @@ except ImportError:
 
 _THRESHOLD = 8 * 1024 * 1024   # 8 MB: files below this get full hash
 _CHUNK = 4 * 1024 * 1024        # 4 MB head + 4 MB tail for large files
-_READ_BUF = 65_536              # streaming read buffer
+_READ_BUF = 1_048_576            # streaming read buffer (1 MB)
 
 
 def quick_hash(path: Path, size: int) -> tuple[str, bool]:

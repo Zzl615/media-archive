@@ -39,6 +39,7 @@ def _get_factory(db_path: Path):
 def scan(
     device: Path = typer.Option(..., help="Mount path of the drive to scan"),
     db: Path = typer.Option(_DEFAULT_DB, help="Path to the index database"),
+    workers: int = typer.Option(1, "--workers", "-w", help="Threads for parallel hashing (1=sequential; try 4 for SSDs)"),
 ):
     """Scan a device: index files, compute hashes, detect exact duplicates."""
     if not device.exists() or not device.is_dir():
@@ -48,7 +49,7 @@ def scan(
     factory = _get_factory(db)
 
     console.print(f"[bold]mard scan[/bold]  device=[cyan]{device}[/cyan]  db=[cyan]{db}[/cyan]")
-    console.print(f"Hash algorithm: [yellow]{HASH_ALGO}[/yellow]\n")
+    console.print(f"Hash algorithm: [yellow]{HASH_ALGO}[/yellow]  workers=[yellow]{workers}[/yellow]\n")
 
     with Progress(
         SpinnerColumn(),
@@ -60,14 +61,12 @@ def scan(
         transient=True,
     ) as progress:
         task = progress.add_task("Phase 1: walking + quick hash…", total=None)
-        counter = {"n": 0}
 
         def on_progress(processed: int, total: int, path: str) -> None:
-            counter["n"] = processed
             progress.update(task, completed=processed, description=f"[dim]{path[-60:]}[/dim]")
 
         try:
-            result = scan_device(device, factory, progress_cb=on_progress)
+            result = scan_device(device, factory, progress_cb=on_progress, workers=workers)
         except KeyboardInterrupt:
             console.print("\n[yellow]Scan interrupted.[/yellow] Progress saved — re-run to resume.")
             raise typer.Exit(130)
@@ -83,6 +82,8 @@ def scan(
     t.add_row("Updated files", str(result.updated))
     t.add_row("Unchanged (skipped)", str(result.skipped))
     t.add_row("Disappeared since last scan", str(result.gone))
+    if result.io_errors:
+        t.add_row("[red]I/O errors (skipped)[/red]", f"[red]{result.io_errors}[/red]")
     t.add_row("Quick-hash collision candidates", str(result.quick_hash_candidates))
     t.add_row("Content-hashed (full)", str(result.content_hashed))
     t.add_row("[yellow]Exact duplicate groups[/yellow]", f"[yellow]{result.exact_dup_groups}[/yellow]")
